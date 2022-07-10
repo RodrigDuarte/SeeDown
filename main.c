@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +20,9 @@
 #define DEBUG_MODE 0
 #define WRITE_MEMORY_CALLBACK   0
 #define WRITE_MEMORY_FILE       1
-
+#define DEDICATED_MANGA 2
+#define DEDICATED_CHAPTER 2
+#define THREADS (DEDICATED_MANGA * DEDICATED_CHAPTER)
 
 struct MemoryStruct {
   char *memory;
@@ -45,8 +48,17 @@ typedef struct manga {
     QUEUE chapters;
 } MANGA;
 
+typedef struct thread_space {
+    MANGA *manga;
+
+    pthread_mutex_t *mutex_manga;
+} SPACE_T;
 
 void get_chapters(MANGA *manga);
+void download_chapter(MANGA *manga, CHAPTER *chapter);
+void *producer(void *args);
+void *organize(void *args);
+void *consumer(void *args);
 
 size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
@@ -94,10 +106,23 @@ void Curl(void *chunk, char *url, int mode) {
     }
 }
 
+ARRAY manga_index;
 QUEUE download;
 int manga_count = 1;
 
+pthread_mutex_t mutex_organizer;
+pthread_cond_t cond_organizer;
+
+pthread_mutex_t mutex_consumer;
+pthread_cond_t cond_consumer;
+
+bool pause_organize = true;
+bool pause_consumer = true;
+
+SPACE_T *spaces[THREADS];
+
 int main(int argc, char *argv[]) {
+    argv = argv;
     curl_global_init(CURL_GLOBAL_ALL);
 
     struct MemoryStruct chunk;
@@ -111,7 +136,7 @@ int main(int argc, char *argv[]) {
     char *json_end = strstr(json_start, "];");
     *(json_end + 1) = '\0';
 
-    ARRAY manga_index = create_array(100);
+    manga_index = create_array(100);
 
     // Create the manga index array from the json string
     while ((json_start = strstr(json_start, "\"i\"")) != NULL) {
@@ -129,174 +154,51 @@ int main(int argc, char *argv[]) {
     chunk.size = 0;
     // End MangaSee database crawler
 
-    download = create_queue();
 
-    // Create the download queue
-    //printf("Create the download queue\n");
+
     if (argc == 1) {
-        char *input = create_string_extra("", 201);
+        pthread_mutex_init(&mutex_organizer, NULL);
+        pthread_cond_init(&cond_organizer, NULL);
 
-        while (true) {
-            printf("Enter manga name: ");
-            fgets(input, 200, stdin);
-            input = lowercase(input);
+        pthread_mutex_init(&mutex_consumer, NULL);
+        pthread_cond_init(&cond_consumer, NULL);
 
-            if (strncmp(input, "!quit\n", 6) == 0) {
-                free(input);
+        download = create_queue();
+
+        pthread_t producer_thread;
+        pthread_t organize_thread;
+        pthread_t consumer_thread[THREADS];
+
+        int thread_ids[THREADS];
+        for (int i = 0; i < THREADS; i++) {
+            thread_ids[i] = i;
+        }
+
+        if (pthread_create(&producer_thread, NULL, producer, NULL) != 0) {
+            printf("Error creating producer thread\n");
+            exit(1);
+        }
+        if (pthread_create(&organize_thread, NULL, organize, NULL) != 0) {
+            printf("Error creating organizer thread\n");
+            exit(1);
+        }
+        for (int i = 0; i < THREADS; i++) {
+            if (pthread_create(&consumer_thread[i], NULL, consumer, (void *) &thread_ids[i]) != 0) {
+                printf("Error creating consumer thread\n");
                 exit(1);
             }
-            else if (strncmp(input, "!do\n", 4) == 0) {
-                free(input);
-                break;
-            }
-            else if (input[0] == '\n') {
-                continue;
-            }
-            else if (strncmp(input, "!help\n", 6) == 0) {
-                printf("\n");
-                printf("!quit - Quit the program\n");
-                printf("!do   - Start the download\n");
-                printf("!help - Show this help\n");
-                printf("\n");
-            }
-
-            MANGA *manga = (MANGA *) malloc(sizeof(struct manga));
-            manga->input_tokens = tokenize(input, " ", 1);
-            manga->best_matches = create_array(3);
-            manga->number_matches = 0;
-            manga->id = manga_count++;
-
-            if (enqueue(download, (void *) manga) == -1) {
-                printf("Manga couldn't be added\n");
-            }
-        }
-    }
-    else {
-        for (int i = 0; i < argc; i++) {
-            MANGA *manga = (MANGA *) malloc(sizeof(struct manga));
-            manga->input_tokens = tokenize(argv[i], " ", 1);
-            manga->best_matches = create_array(3);
-            manga->id = manga_count++;
-            manga->number_matches = 0;
-            enqueue(download, (void *) manga);
-        }
-    }
-
-    // Search for the manga in the database
-    //printf("Search for the manga in the database\n");
-    for (int i = 0; i < manga_index->size; i++) {
-        char *database = lowercase(create_string(manga_index->data[i]));
-        ARRAY database_tokens = tokenize(database, "-", 1);
-
-        QUEUE_NODE download_node = download->head;
-
-        while (download_node != NULL) {
-            MANGA *dl_manga = (MANGA *) download_node->data;
-            int local_matches = 0;
-
-            for (int j = 0; j < dl_manga->input_tokens->size; j++) {
-                for (int k = 0; k < database_tokens->size; k++) {
-                    if (strstr((char *) database_tokens->data[k],
-                            (char *) dl_manga->input_tokens->data[j]) != NULL) {
-                        local_matches++;
-                        //printf("\t\t\t\t\t\t%s | %d\n", database, local_matches);
-                        break;
-                    }
-                }
-            }
-
-            if (local_matches != 0 && local_matches > dl_manga->number_matches) {
-                //printf("\t\t\t\t\t\tClearing and adding to best matches\n");
-                dl_manga->best_matches = clear_array(dl_manga->best_matches);
-                dl_manga->number_matches = local_matches;
-                dl_manga->best_matches = add_array(dl_manga->best_matches,
-                        (void *) create_string((char *) manga_index->data[i]));
-            }
-            else if (local_matches != 0 && local_matches == dl_manga->number_matches) {
-                //printf("\t\t\t\t\t\tAdding to best matches\n");
-                dl_manga->best_matches = add_array(dl_manga->best_matches,
-                        (void *) create_string((char *) manga_index->data[i]));
-            }
-            
-            download_node = download_node->next;
         }
         
-        free(database);
-        destroy_array(database_tokens);
-    }
-    
-    // Confirm the manga to be downloaded
-    //printf("Confirm the manga to be downloaded\n");
-    QUEUE_NODE download_node = download->head;
-    while (download_node != NULL) {
-        MANGA *dl_manga = (MANGA *) download_node->data;
-        ARRAY best_matches = dl_manga->best_matches;
-
-        if (best_matches->size == 0) {
-            printf("No matches found for \"");
-            for (int i = 0; i < dl_manga->input_tokens->size; i++) {
-                if (i != dl_manga->input_tokens->size - 1) {
-                    printf("%s ", (char *) dl_manga->input_tokens->data[i]);
-                }
-                else {
-                    printf("%s\"\n", (char *) dl_manga->input_tokens->data[i]);
-                }
-            }
-            
-            remove_list((LIST) download, (void *) dl_manga);
+        pthread_join(producer_thread, NULL);
+        pthread_join(organize_thread, NULL);
+        for (int i = 0; i < THREADS; i++) {
+            pthread_join(consumer_thread[i], NULL);
         }
-        else if (best_matches->size == 1) {
-            printf("%d: %s\n", dl_manga->id, (char *) best_matches->data[0]);
-
-            // https://mangasee123.com/manga/<manga_name>
-            int manga_url_len = 30 + strlen((char *) best_matches->data[0]) + 1;
-            dl_manga->manga_url = create_string_extra("", manga_url_len);
-            snprintf(dl_manga->manga_url, manga_url_len, "https://mangasee123.com/manga/%s",
-                    (char *) best_matches->data[0]);
-
-            dl_manga->manga_name = create_string((char *) best_matches->data[0]);
-            replace_char(dl_manga->manga_name, '-', ' ');
-
-            get_chapters(dl_manga);
-        }
-        else {
-            int choice = -1;
-
-            do {
-                for (int i = 0; i < best_matches->size; i++) {
-                    printf("%d: %d: %s\n", dl_manga->id, i + 1, (char *) best_matches->data[i]);
-                }
-                
-                printf("Enter the number of the manga you want to download: ");
-                scanf("%d", &choice);
-            } while (choice <= 0 || choice >= best_matches->size);        
-
-            // https://mangasee123.com/manga/<manga_name>
-            int manga_url_len = 30 + strlen((char *) best_matches->data[choice - 1]) + 1;
-            dl_manga->manga_url = create_string_extra("", manga_url_len);
-            snprintf(dl_manga->manga_url, manga_url_len, "https://mangasee123.com/manga/%s",
-                    (char *) best_matches->data[choice - 1]);
-
-            dl_manga->manga_name = create_string((char *) best_matches->data[choice - 1]);
-            replace_char(dl_manga->manga_name, '-', ' ');
-
-            get_chapters(dl_manga);
-        }
-
-        download_node = download_node->next;
     }
-    
-
-    // Download the manga
-    LIST_NODE download_list_node = (LIST_NODE) download->head;
-    while (download_list_node != NULL) {
-        printf("%s\n", ((MANGA *) download_list_node->data)->manga_name);
-        download_list_node = download_list_node->next;
-    }
-    
-    destroy_list((LIST) download);
     
     free(manga_index);
+
+    destroy_list((LIST) download);
 
     return 0;
 }
@@ -382,3 +284,361 @@ void get_chapters(MANGA *manga) {
     return;
 }
 
+void download_chapter(MANGA *manga, CHAPTER *chapter) {
+    char *chapter_url = chapter->chapter_url;
+    char *chapter_name = chapter->chapter_name;
+    float id = chapter->id;
+
+    char id_string[11];
+    sprintf(id_string, "%0*.5f", 10, id);
+
+    // We hide this code cause it is garbage
+    for (int i = 5; i < 10; i++) {
+        if (id_string[i] == '0') {
+            if (i == 5) {
+                id_string[i - 1] = '\0';
+                break;
+            }
+
+            id_string[i] = '\0';
+            break;
+        }
+    }
+
+    // Create path for chapter -> ./manga/manga_name/chapter_number/
+    int dir_name_length = 8 + (int) strlen(manga->manga_name) + 1 + (int) sizeof(id_string);
+    char *dir_name = (char *) malloc(dir_name_length);
+    snprintf(dir_name, dir_name_length, "./manga/%s/%s", manga->manga_name, id_string);
+
+    int result = mkdir(dir_name, 0777);
+    if (result == -1) printf("Error creating directory or already existent: %s\n", dir_name);
+
+    struct MemoryStruct chunk;
+
+    chunk.memory = malloc(1);   /* will be grown as needed by the realloc above */
+    chunk.size = 0;             /* no data at this point */
+
+    Curl(&chunk, chapter_url, WRITE_MEMORY_CALLBACK);
+
+    // Get the number of pages in this chapter [vm.CurChapter = {..."Page":"<%d>"]
+    char *page_number = strstr(chunk.memory, "vm.CurChapter = ") + 16;
+    page_number = strstr(page_number, "Page\":\"") + 7;
+    int page_total = atoi(page_number);
+
+    // Get the chapter domain host [vm.CurPathName = "<%s>"]
+    char *domain_host = strstr(chunk.memory, "vm.CurPathName = ") + 18;
+    char *domain_end = strstr(domain_host, "\";");
+    *domain_end = '\0';
+
+    // Create the url -> https://<domain_host>/manga/<manga_link>/0000.0-
+    int url_length = 9 + (int) strlen(domain_host) + 7 + (int) strlen(manga->manga_url) + 25 + 1;
+    char *domain_url = (char *) malloc(url_length);
+    snprintf(domain_url, url_length, "https://%s/manga/%s/%s-", domain_host, manga->manga_url, id_string);
+
+    free(chunk.memory);
+    chunk.memory = NULL;
+    chunk.size = 0;
+
+    for (int page_count = 1; page_count <= page_total; page_count++) {
+        // Create the url -> https://<domain_host>/manga/<manga_link>/0000.0-000.png
+        int page_url_length = (int) strlen(domain_url) + 3 + 5;
+        char *page_url = (char *) malloc(page_url_length);
+        snprintf(page_url, page_url_length, "%s%03d.png", domain_url, page_count);
+        //printf("%s\n", page_url);
+
+        // Create the path -> ./manga/<dir_name>/<chapter_number> - <page_number>.png
+        int img_filename_length = strlen(dir_name) + 1 + strlen(chapter_name) + 1 + 3 + 4;
+        char *img_filename = (char *) malloc(img_filename_length);
+        snprintf(img_filename, img_filename_length, "%s/%s-%03d.png", dir_name, id_string, page_count);
+        
+        Curl((void *) img_filename, page_url, WRITE_MEMORY_FILE);
+
+        free(page_url);
+        free(img_filename);
+    }
+
+    free(domain_url);
+    free(dir_name);
+}
+
+
+/* Thread section */
+void *producer(void *args) {
+    sleep(1);
+    args = args;
+
+    char *input = create_string_extra("", 201);
+
+    while (true) {
+        printf("Enter manga name: ");
+        fgets(input, 200, stdin);
+        input = lowercase(input);
+
+        if (strncmp(input, "!quit\n", 6) == 0) {
+            free(input);
+            exit(1);
+        }
+        else if (strncmp(input, "!do\n", 4) == 0) {
+            pthread_mutex_lock(&mutex_organizer);
+            pause_organize = false;
+            pthread_cond_broadcast(&cond_organizer);
+            pthread_mutex_unlock(&mutex_organizer);
+            continue;
+        }
+        else if (input[0] == '\n') {
+            continue;
+        }
+        else if (strncmp(input, "!help\n", 6) == 0) {
+            printf("\n");
+            printf("!quit - Quit the program\n");
+            printf("!do   - Start the download\n");
+            printf("!help - Show this help\n");
+            printf("\n");
+        }
+
+        MANGA *manga = (MANGA *) malloc(sizeof(struct manga));
+        manga->input_tokens = tokenize(input, " ", 1);
+        manga->best_matches = create_array(3);
+        manga->number_matches = 0;
+        manga->id = manga_count++;
+
+        // Get the best match for the manga name
+        for (int i = 0; i < manga_index->size; i++) {
+            char *database_single = lowercase(create_string(manga_index->data[i]));
+            ARRAY database_tokens = tokenize(database_single, "-", 1);
+
+
+            int local_matches = 0;
+
+            for (int j = 0; j < manga->input_tokens->size; j++) {
+                for (int k = 0; k < database_tokens->size; k++) {
+                    if (strstr((char *) database_tokens->data[k],
+                            (char *) manga->input_tokens->data[j]) != NULL) {
+                        local_matches++;
+                        //printf("\t\t\t\t\t\t%s | %d\n", database, local_matches);
+                        break;
+                    }
+                }
+            }
+
+            if (local_matches != 0 && local_matches > manga->number_matches) {
+                //printf("\t\t\t\t\t\tClearing and adding to best matches\n");
+                manga->best_matches = clear_array(manga->best_matches);
+                manga->number_matches = local_matches;
+                manga->best_matches = add_array(manga->best_matches,
+                        (void *) create_string((char *) manga_index->data[i]));
+            }
+            else if (local_matches != 0 && local_matches == manga->number_matches) {
+                //printf("\t\t\t\t\t\tAdding to best matches\n");
+                manga->best_matches = add_array(manga->best_matches,
+                        (void *) create_string((char *) manga_index->data[i]));
+            }
+            
+            free(database_single);
+            destroy_array(database_tokens);
+        }
+        // End of best match search
+
+        if (manga->best_matches->size == 0) {
+            printf("No matches found for \"");
+            for (int i = 0; i < manga->input_tokens->size; i++) {
+                if (i != manga->input_tokens->size - 1) {
+                    printf("%s ", (char *) manga->input_tokens->data[i]);
+                }
+                else {
+                    printf("%s\"\n", (char *) manga->input_tokens->data[i]);
+                }
+            }
+
+            destroy_array(manga->input_tokens);
+            destroy_array(manga->best_matches);
+            free(manga);
+            printf("\t\t\t\t\t\t\t\t   Producer : input invalid\n");
+            continue;
+        }
+        else if (manga->best_matches->size == 1) {
+            printf("%d: %s\n", manga->id, (char *) manga->best_matches->data[0]);
+
+            // https://mangasee123.com/manga/<manga_name>
+            int manga_url_len = 30 + strlen((char *) manga->best_matches->data[0]) + 1;
+            manga->manga_url = create_string_extra("", manga_url_len);
+            snprintf(manga->manga_url, manga_url_len, "https://mangasee123.com/manga/%s",
+                    (char *) manga->best_matches->data[0]);
+
+            manga->manga_name = create_string((char *) manga->best_matches->data[0]);
+            replace_char(manga->manga_name, '-', ' ');
+        }
+        else {
+            int choice = -1;
+
+            do {
+                for (int i = 0; i < manga->best_matches->size; i++) {
+                    printf("%d: %d: %s\n", manga->id, i + 1, (char *) manga->best_matches->data[i]);
+                }
+                
+                printf("Enter the number of the manga you want to download: ");
+                scanf("%d", &choice);
+            } while (choice <= 0 || choice >= manga->best_matches->size);        
+
+            // https://mangasee123.com/manga/<manga_name>
+            int manga_url_len = 30 + strlen((char *) manga->best_matches->data[choice - 1]) + 1;
+            manga->manga_url = create_string_extra("", manga_url_len);
+            snprintf(manga->manga_url, manga_url_len, "https://mangasee123.com/manga/%s",
+                    (char *) manga->best_matches->data[choice - 1]);
+
+            manga->manga_name = create_string((char *) manga->best_matches->data[choice - 1]);
+            replace_char(manga->manga_name, '-', ' ');
+        }
+
+        get_chapters(manga);
+        if (enqueue(download, (void *) manga) == -1) {
+            printf("Manga couldn't be added\n");
+        }
+    }
+
+    return NULL;
+}
+
+void *organize(void *args) {
+    args = args;
+
+    while (true) {
+        pthread_mutex_lock(&mutex_organizer);
+        while (pause_organize) {
+            printf("Organizer : waiting for a book to be produced or finished\n");
+            pthread_cond_wait(&cond_organizer, &mutex_organizer);
+            pause_consumer = true;
+        }
+
+        // My code
+
+        if (download->size == 0) {
+            printf("Organizer : no books to download\n");
+            pause_organize = true;
+            pthread_mutex_unlock(&mutex_organizer);
+            continue;
+        }
+
+        /* Test to see chapter numbers
+        LIST_NODE node = (LIST_NODE) download->head;
+        while (node != NULL) {
+
+            MANGA *manga = (MANGA *) node->data;
+            LIST_NODE chapter = (LIST_NODE) manga->chapters->head;
+            printf("Organizer : %s [", manga->manga_name);
+            while (chapter != NULL) {
+                if (chapter->next == NULL) {
+                    printf("%.2f]\n", ((CHAPTER *) chapter->data)->id);
+                }
+                else {
+                    printf("%.2f, ", ((CHAPTER *) chapter->data)->id);
+                }
+                
+                chapter = chapter->next;
+            }
+
+            node = node->next;
+        }
+        */
+
+        LIST_NODE node = (LIST_NODE) download->head;
+        int minimum = (download->size > DEDICATED_MANGA) ? DEDICATED_MANGA : download->size;
+        for (int i = 0; i < THREADS; i++) {
+            if (i < minimum) {
+                SPACE_T *space = (SPACE_T *) malloc(sizeof(SPACE_T));
+                space->manga = (MANGA *) node->data;
+                space->mutex_manga = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+                pthread_mutex_init(space->mutex_manga, NULL);
+
+                spaces[i] = space;
+                node = node->next;
+            } else {
+                spaces[i] = spaces[i - minimum];
+            }
+        }
+
+        for (int i = 0; i < THREADS; i++) {
+
+            if (spaces[i]->manga == NULL) printf("\t\t\t\t\t\t\t\t   Organizer : space %d, book is NULL\n", i);
+            printf("Organizer : manga \"%s\" added to space %d\n", spaces[i]->manga->manga_name, i);
+            // printf("Organizer : book added to space %d\n", i);
+
+        }
+
+        // My code end
+
+        pause_organize = true;
+        
+        pthread_mutex_lock(&mutex_consumer);
+        pause_consumer = false;
+        pthread_cond_broadcast(&cond_consumer);
+        pthread_mutex_unlock(&mutex_consumer);
+
+        pthread_mutex_unlock(&mutex_organizer);
+    }
+
+    return NULL;
+}
+
+void *consumer(void *args) {
+    int thread_id = *(int *) args;
+
+    while (true) {
+        pthread_mutex_lock(&mutex_consumer);
+        while (pause_consumer) {
+            printf("Consumer %d: waiting for book\n", thread_id);
+            pthread_cond_wait(&cond_consumer, &mutex_consumer);
+        }
+
+        pthread_mutex_unlock(&mutex_consumer);
+        // My code
+
+        if (spaces[thread_id] == NULL) {
+            printf("Consumer %d: space is empty\n", thread_id);
+            pause_consumer = true;
+            continue;
+        }
+
+        pthread_mutex_t *mutex_manga = spaces[thread_id]->mutex_manga;
+
+        pthread_mutex_lock(mutex_manga);
+        
+        if (spaces[thread_id]->manga == NULL) {
+            printf("Consumer %d: space has no book\n", thread_id);
+            pause_consumer = true;
+            pthread_mutex_unlock(mutex_manga);
+            continue;
+        }
+
+        MANGA *manga = spaces[thread_id]->manga;
+        if (spaces[thread_id]->manga->chapters->size == 0) {
+            printf("Consumer %d: space has a book, but no chapters\n", thread_id);
+            pause_consumer = true;
+
+            remove_list((LIST) download, (void *) manga);
+            manga = NULL;
+
+            pthread_mutex_lock(&mutex_organizer);
+            pause_organize = false;
+            pthread_cond_broadcast(&cond_organizer);
+            pthread_mutex_unlock(&mutex_organizer);
+
+            pthread_mutex_unlock(mutex_manga);
+            continue;
+        }
+
+        CHAPTER *chapter = (CHAPTER *) dequeue(manga->chapters);
+
+        pthread_mutex_unlock(mutex_manga);
+
+        if (chapter != NULL) {
+            sleep(1);
+            printf("Consumer %d: space has downloaded chapter %.2f from book %s\n", thread_id, chapter->id, manga->manga_name);
+            download_chapter(manga, chapter);
+        }
+
+        // My code end
+    }
+
+    return NULL;
+}

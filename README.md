@@ -1,2 +1,2 @@
-# seedown
+# SeeDown
 A MangaSee manga downloader
