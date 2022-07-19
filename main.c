@@ -24,6 +24,7 @@
 #define DEDICATED_CHAPTER 2
 #define THREADS (DEDICATED_MANGA * DEDICATED_CHAPTER)
 
+
 struct MemoryStruct {
   char *memory;
   size_t size;
@@ -38,6 +39,7 @@ typedef struct chapter {
 
 typedef struct manga {
     int id;
+    char *manga_name_database;
     char *manga_name;
     char *manga_url;
 
@@ -54,8 +56,10 @@ typedef struct thread_space {
     pthread_mutex_t *mutex_manga;
 } SPACE_T;
 
+
 void get_chapters(MANGA *manga);
 void download_chapter(MANGA *manga, CHAPTER *chapter);
+void parse_input(char *input, MANGA *manga);
 void *producer(void *args);
 void *organize(void *args);
 void *consumer(void *args);
@@ -120,6 +124,74 @@ bool pause_organize = true;
 bool pause_consumer = true;
 
 SPACE_T *spaces[THREADS];
+
+void parse_input(char *input, MANGA *manga) {
+    if (input == NULL || manga == NULL) {
+        return;
+    }
+    
+    float f1 = 0, f2 = 0;
+    char c1 = ' ';
+    char string[100];
+    //printf("%s\n", input);
+
+    if (sscanf(input, "[%f-%f%c", &f1, &f2, &c1) == 3) {
+        if (c1 == ']') { // Input is correct
+            float latest_chapter = ((CHAPTER *) (manga->chapters->head->data))->id;
+            f1 = ((f1 < 0) ? -f1 : f1);
+            f2 = ((f2 < 0) ? -f2 : f2);
+            if (f2 < f1) { float temp = f1; f1 = f2; f2 = temp; }
+            if (f1 > latest_chapter) { f1 = latest_chapter; }
+            if (f2 > latest_chapter) { f2 = latest_chapter; }
+
+            //printf("%f %f\n", f1, f2);
+
+            LIST temp = create_list();
+            LIST_NODE node = (LIST_NODE) manga->chapters->head;
+            while (node != NULL) {
+                CHAPTER *chapter = (CHAPTER *) node->data;
+                if (chapter->id >= f1 && chapter->id <= f2) {
+                    CHAPTER *copy = (CHAPTER *) malloc(sizeof(CHAPTER));
+                    copy->id = chapter->id;
+                    copy->chapter_name = chapter->chapter_name;
+                    copy->chapter_url = chapter->chapter_url;
+                    add_tail_list(temp, (void *) copy);
+                }
+                node = node->next;
+            }
+            destroy_list((LIST) manga->chapters);
+            manga->chapters = (QUEUE) temp;
+
+            return;
+        }
+    }
+    else if (sscanf(input, "[%99[^]]%c", string, &c1) == 2) {
+        if (c1 == ']') {
+            if (strncmp(string, "all", 3) == 0) {
+                return;
+            }
+            else if (strncmp(string, "latest", 6) == 0) {
+                LIST temp = create_list();
+
+                CHAPTER *chapter = manga->chapters->head->data;
+
+                CHAPTER *copy = (CHAPTER *) malloc(sizeof(CHAPTER));
+                copy->id = chapter->id;
+                copy->chapter_name = chapter->chapter_name;
+                copy->chapter_url = chapter->chapter_url;
+
+                add_tail_list(temp, (void *) copy);
+                destroy_list((LIST) manga->chapters);
+                manga->chapters = (QUEUE) temp;
+
+                return;
+            }
+        }
+    }
+
+    printf("Error: Invalid chapter selection format. Try \"[<begin>-<end>]\"\n");
+    return;
+}
 
 int main(int argc, char *argv[]) {
     argv = argv;
@@ -272,15 +344,6 @@ void get_chapters(MANGA *manga) {
     free(xml);
     free(manga_dir);
 
-    /* Debugging purposes
-    LIST_NODE chapter_list_node = (LIST_NODE) manga->chapters->head;
-    while (chapter_list_node != NULL) {
-        CHAPTER *chapter = (CHAPTER *) chapter_list_node->data;
-        printf("%f\n", chapter->id);
-        chapter_list_node = chapter_list_node->next;
-    }
-    */
-
     return;
 }
 
@@ -331,9 +394,9 @@ void download_chapter(MANGA *manga, CHAPTER *chapter) {
     *domain_end = '\0';
 
     // Create the url -> https://<domain_host>/manga/<manga_link>/0000.0-
-    int url_length = 9 + (int) strlen(domain_host) + 7 + (int) strlen(manga->manga_url) + 25 + 1;
+    int url_length = 9 + (int) strlen(domain_host) + 7 + (int) strlen(manga->manga_name_database) + 25 + 1;
     char *domain_url = (char *) malloc(url_length);
-    snprintf(domain_url, url_length, "https://%s/manga/%s/%s-", domain_host, manga->manga_url, id_string);
+    snprintf(domain_url, url_length, "https://%s/manga/%s/%s-", domain_host, manga->manga_name_database, id_string);
 
     free(chunk.memory);
     chunk.memory = NULL;
@@ -344,7 +407,7 @@ void download_chapter(MANGA *manga, CHAPTER *chapter) {
         int page_url_length = (int) strlen(domain_url) + 3 + 5;
         char *page_url = (char *) malloc(page_url_length);
         snprintf(page_url, page_url_length, "%s%03d.png", domain_url, page_count);
-        //printf("%s\n", page_url);
+        printf("%s\n", page_url);
 
         // Create the path -> ./manga/<dir_name>/<chapter_number> - <page_number>.png
         int img_filename_length = strlen(dir_name) + 1 + strlen(chapter_name) + 1 + 3 + 4;
@@ -390,10 +453,25 @@ void *producer(void *args) {
         }
         else if (strncmp(input, "!help\n", 6) == 0) {
             printf("\n");
+            printf("!help - Show this help\n");
             printf("!quit - Quit the program\n");
             printf("!do   - Start the download\n");
-            printf("!help - Show this help\n");
+            printf("--- Options ---\n");
+            printf("\t Select chapters to download (place at the end of manga name): \"[<begin>-<end>]\"");
             printf("\n");
+            continue;
+        }
+
+        char *chapter_selector = NULL;
+        if (strchr(input, '[') != NULL && strchr(input, ']') != NULL) {
+            chapter_selector = create_string(strchr(input, '['));
+
+            char *pos = strchr(chapter_selector, ']');
+            *(pos + 1) = '\0';
+
+            pos = strchr(input, '[');
+            *pos = '\0';
+            printf("%s\n", chapter_selector);
         }
 
         MANGA *manga = (MANGA *) malloc(sizeof(struct manga));
@@ -453,7 +531,6 @@ void *producer(void *args) {
             destroy_array(manga->input_tokens);
             destroy_array(manga->best_matches);
             free(manga);
-            printf("\t\t\t\t\t\t\t\t   Producer : input invalid\n");
             continue;
         }
         else if (manga->best_matches->size == 1) {
@@ -467,6 +544,8 @@ void *producer(void *args) {
 
             manga->manga_name = create_string((char *) manga->best_matches->data[0]);
             replace_char(manga->manga_name, '-', ' ');
+
+            manga->manga_name_database = create_string((char *) manga->best_matches->data[0]);
         }
         else {
             int choice = -1;
@@ -488,12 +567,17 @@ void *producer(void *args) {
 
             manga->manga_name = create_string((char *) manga->best_matches->data[choice - 1]);
             replace_char(manga->manga_name, '-', ' ');
+
+            manga->manga_name_database = create_string((char *) manga->best_matches->data[choice - 1]);
         }
 
         get_chapters(manga);
+        parse_input(chapter_selector, manga);
         if (enqueue(download, (void *) manga) == -1) {
             printf("Manga couldn't be added\n");
         }
+
+        free(chapter_selector);
     }
 
     return NULL;
